@@ -7,26 +7,11 @@ import concurrent.futures
 import threading
 import time
 import logging
+import requests
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
 from django.conf import settings
-
-# ----------------------------------------------------------------------
-# Persistent agent for cumulative analysis (starts once, reused)
-# ----------------------------------------------------------------------
-_CUMULATIVE_AGENT = None
-_CUMULATIVE_AGENT_LOCK = threading.Lock()
-
-def get_cumulative_agent():
-    """Reuse a single SilentAgent for all cumulative analyses."""
-    global _CUMULATIVE_AGENT
-    if _CUMULATIVE_AGENT is None:
-        with _CUMULATIVE_AGENT_LOCK:
-            if _CUMULATIVE_AGENT is None:
-                from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
-                _CUMULATIVE_AGENT = SilentAgent(start_servers=True)
-    return _CUMULATIVE_AGENT
 
 # ----------------------------------------------------------------------
 # 1. Make sure the MCP agent root is in sys.path
@@ -232,7 +217,7 @@ def analyze_cumulative_risks(
 ) -> Dict[str, Any]:
     """
     Run only Phases C, D, E using cached investigation reports.
-    Uses a persistent agent; if it fails, creates a fresh one.
+    Creates a fresh agent for each call (to avoid loop deadlocks).
     """
     import time
     start_time = time.time()
@@ -330,53 +315,37 @@ def analyze_cumulative_risks(
     if not findings:
         return {"error": "No chemical findings could be extracted from the provided reports"}
 
-    # Try to use persistent agent; if it fails (loop closed or dead), create a fresh one
+    # Create a fresh agent each time (to avoid event loop issues)
+    from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
     agent = None
     try:
-        agent = get_cumulative_agent()
-        loop = agent._loop
-        if loop.is_closed():
-            raise RuntimeError("Persistent agent loop is closed")
-    except Exception as e:
-        print(f"⚠️ Persistent agent unavailable ({e}). Creating a fresh agent for this call.")
-        from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
         agent = SilentAgent(start_servers=True)
         loop = agent._loop
 
-    async def _run_cumulative():
-        print(f"🔗 Phase C: combination analysis...")
-        combination = await asyncio.wait_for(agent._phase_combination(findings, agent_products), timeout=timeout_seconds//2)
-        print(f"   Phase C done in {time.time()-start_time:.1f}s")
+        async def _run_cumulative():
+            print(f"🔗 Phase C: combination analysis...")
+            combination = await asyncio.wait_for(agent._phase_combination(findings, agent_products), timeout=timeout_seconds//2)
+            print(f"   Phase C done in {time.time()-start_time:.1f}s")
 
-        print(f"📝 Phase D: building final report...")
-        report_dict = agent._build_final_report(
-            agent_products,
-            filter_result={"chemicals": [], "safe_skipped": []},
-            findings=findings,
-            combination=combination
-        )
-        print(f"   Phase D done in {time.time()-start_time:.1f}s")
+            print(f"📝 Phase D: building final report...")
+            report_dict = agent._build_final_report(
+                agent_products,
+                filter_result={"chemicals": [], "safe_skipped": []},
+                findings=findings,
+                combination=combination
+            )
+            print(f"   Phase D done in {time.time()-start_time:.1f}s")
 
-        print(f"📈 Phase E: scoring server...")
-        report_dict = await asyncio.wait_for(agent._enhance_with_scoring_server(report_dict), timeout=timeout_seconds//2)
-        print(f"   Phase E done in {time.time()-start_time:.1f}s")
-        return report_dict
+            print(f"📈 Phase E: scoring server...")
+            report_dict = await asyncio.wait_for(agent._enhance_with_scoring_server(report_dict), timeout=timeout_seconds//2)
+            print(f"   Phase E done in {time.time()-start_time:.1f}s")
+            return report_dict
 
-    try:
         future = asyncio.run_coroutine_threadsafe(_run_cumulative(), loop)
         cumulative_report = future.result(timeout=timeout_seconds)
         print(f"✅ Cumulative analysis completed in {time.time()-start_time:.1f}s")
-        # If we used a fresh agent, replace the global persistent one (close old)
-        if agent is not get_cumulative_agent():
-            global _CUMULATIVE_AGENT
-            old = _CUMULATIVE_AGENT
-            _CUMULATIVE_AGENT = agent
-            if old:
-                try:
-                    old.close()
-                except:
-                    pass
         return cumulative_report
+
     except concurrent.futures.TimeoutError:
         print(f"❌ Timeout after {timeout_seconds}s")
         return {"error": f"Cumulative analysis timed out after {timeout_seconds} seconds"}
@@ -384,6 +353,59 @@ def analyze_cumulative_risks(
         logger.exception("Cumulative analysis failed")
         print(f"❌ Exception: {type(e).__name__}: {e}")
         return {"error": str(e)}
+    finally:
+        if agent:
+            try:
+                agent.close()
+            except:
+                pass
+
+
+def send_report_to_recommendation_api(
+    report_dict: Dict[str, Any],
+    base_url: str = "http://127.0.0.1:8000"
+) -> Dict[str, Any]:
+    """
+    Send the cumulative report to the recommendation research endpoint.
+    """
+    url = f"{base_url}/api/recommend/research/report"
+    try:
+        response = requests.post(url, json=report_dict, timeout=60)
+        if response.status_code == 200:
+            logger.info("Recommendation API called successfully.")
+            return response.json()
+        else:
+            logger.warning(f"Recommendation API returned {response.status_code}: {response.text[:200]}")
+            return {"error": f"HTTP {response.status_code}"}
+    except requests.exceptions.Timeout:
+        logger.warning("Recommendation API timed out after 60 seconds")
+        return {"error": "Timeout"}
+    except Exception as e:
+        logger.error(f"Failed to call recommendation API: {e}")
+        return {"error": str(e)}
+
+
+def should_trigger_recommendation_api(report_dict: Dict[str, Any]) -> bool:
+    """
+    Determine whether the cumulative report contains a verdict that warrants
+    calling the recommendation research API.
+    """
+    product_verdicts = report_dict.get("product_verdicts", [])
+    for pv in product_verdicts:
+        rec = pv.get("recommendation", "").lower()
+        risk_level = pv.get("risk_level", "").upper()
+        if rec in ["reduce", "reduce_use", "keep", "eliminate"]:
+            return True
+        if risk_level in ["HIGH", "CRITICAL", "MODERATE"]:
+            return True
+
+    scoring = report_dict.get("scoring_analysis", {})
+    for pr in scoring.get("product_risk_results", []):
+        verdict = pr.get("verdict", "").upper()
+        if verdict in ["HIGH", "CRITICAL", "MODERATE"]:
+            return True
+
+    return False
 
 
 if __name__ == "__main__":

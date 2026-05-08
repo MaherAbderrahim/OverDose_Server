@@ -21,7 +21,9 @@ from risk.services import (
     analyze_ingredients_risks,
     analyze_cumulative_risks,
     extract_filtering_report,
-    extract_investigation_report
+    extract_investigation_report,
+    send_report_to_recommendation_api, 
+    should_trigger_recommendation_api,
 )
 
 from products.models import Product, UserProductDecision
@@ -39,7 +41,6 @@ from .models import Scan
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
-
 
 class ScanPipelineAPIView(APIView):
     def post(self, request):
@@ -60,7 +61,6 @@ class ScanPipelineAPIView(APIView):
         cloudinary_ready, _ = cloudinary_service.get_readiness()
         cloudinary_folder = settings.cloudinary_folder or None
 
-        # Store analysis results
         product_name = None
         product_brand = None
         product_barcode = None
@@ -117,11 +117,9 @@ class ScanPipelineAPIView(APIView):
         saved_report_path = None
 
         if ingredients:
-            # Generate ingredients hash for lookup
             ingredients_str = ",".join(sorted([i.strip().lower() for i in ingredients if i]))
             ingredients_hash = hashlib.md5(ingredients_str.encode()).hexdigest()
 
-            # Try to find existing product by barcode first, then by ingredients hash
             existing_product = None
 
             if product_barcode:
@@ -134,7 +132,6 @@ class ScanPipelineAPIView(APIView):
                 product = existing_product
                 logger.info(f"Product found: {product.id} - {product.name}")
 
-                # Check if investigation report is empty
                 if not product.investigation_report or product.investigation_report == {}:
                     logger.info(f"Product {product.id} has empty investigation_report, refilling...")
                     user_type = request.user.user_type if request.user.is_authenticated else None
@@ -147,7 +144,6 @@ class ScanPipelineAPIView(APIView):
                     agent_debug_log = debug_log
                     saved_report_path = file_path
 
-                    # Extract filtering and investigation parts
                     filtering_data = extract_filtering_report(full_agent_report)
                     investigation_data = extract_investigation_report(full_agent_report)
 
@@ -159,7 +155,6 @@ class ScanPipelineAPIView(APIView):
                     full_agent_report = product.investigation_report
                     logger.info(f"Using cached investigation_report for product {product.id}")
             else:
-                # Product not found - create new
                 logger.info(f"Product not found, creating new with hash: {ingredients_hash}")
 
                 extraction_method = "unknown"
@@ -190,7 +185,6 @@ class ScanPipelineAPIView(APIView):
                 agent_debug_log = debug_log
                 saved_report_path = file_path
 
-                # Extract filtering and investigation parts
                 filtering_data = extract_filtering_report(full_agent_report)
                 investigation_data = extract_investigation_report(full_agent_report)
 
@@ -198,11 +192,9 @@ class ScanPipelineAPIView(APIView):
                 product.investigation_report = investigation_data
                 product.save(update_fields=["filtering_report", "investigation_report", "updated_at"])
 
-            # Link scan to product
             scan.product = product
             scan.save(update_fields=["product"])
 
-            # Create or update user decision
             if request.user.is_authenticated:
                 user_decision_obj, created = UserProductDecision.objects.get_or_create(
                     user=request.user,
@@ -211,7 +203,7 @@ class ScanPipelineAPIView(APIView):
                 )
                 user_decision = user_decision_obj.decision
 
-            # --- CUMULATIVE ANALYSIS (Phases C, D, E) ---
+            # --- CUMULATIVE ANALYSIS ---
             cumulative_report = None
             if request.user.is_authenticated:
                 try:
@@ -248,10 +240,27 @@ class ScanPipelineAPIView(APIView):
                         cumulative_report = analyze_cumulative_risks(
                             products_for_cumulative,
                             user_type=request.user.user_type if hasattr(request.user, 'user_type') else None,
-                            timeout_seconds=600
+                            timeout_seconds=300
                         )
-                        request.user.ai_report = cumulative_report
-                        request.user.save(update_fields=['ai_report', 'updated_at'])
+
+                        if "error" not in cumulative_report:
+                            request.user.ai_report = cumulative_report
+                            request.user.save(update_fields=['ai_report', 'updated_at'])
+
+                            # Conditionally send to recommendation API
+                            if should_trigger_recommendation_api(cumulative_report):
+                                try:
+                                    base_url = request.build_absolute_uri('/').rstrip('/')
+                                    recommendations = send_report_to_recommendation_api(cumulative_report, base_url)
+                                    cumulative_report["recommendations_from_api"] = recommendations
+                                except Exception as e:
+                                    logger.warning(f"Could not send report to recommendation API: {e}")
+                                    cumulative_report["recommendations_from_api"] = {"error": str(e)}
+                            else:
+                                logger.info("No actionable recommendation; skipping API call.")
+                                cumulative_report["recommendations_from_api"] = {"info": "No high-risk products found; search API not triggered."}
+                        else:
+                            logger.warning(f"Cumulative analysis returned error: {cumulative_report.get('error')}")
                     else:
                         cumulative_report = {"info": "Only one product in user's list, cumulative analysis skipped."}
 
@@ -277,12 +286,10 @@ class ScanPipelineAPIView(APIView):
                 except Exception as e:
                     logger.warning(f"Could not extract risks from report: {e}")
         else:
-            # No ingredients extracted, use mock risks
             risk_items, full_agent_report, debug_log, file_path = analyze_ingredients_risks([])
             agent_debug_log = debug_log
             saved_report_path = file_path
 
-        # Keep mock recommendations
         recommendation_result = build_mock_recommendations(scan.id, risk_items)
 
         payload = {
@@ -302,8 +309,6 @@ class ScanPipelineAPIView(APIView):
         response_serializer = ScanPipelineResponseSerializer(data=payload)
         response_serializer.is_valid(raise_exception=True)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-
-
 class ScanSegmentationAPIView(APIView):
     def post(self, request):
         image = request.FILES.get("image")
