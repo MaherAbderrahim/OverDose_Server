@@ -248,7 +248,7 @@ class ScanPipelineAPIView(APIView):
                         cumulative_report = analyze_cumulative_risks(
                             products_for_cumulative,
                             user_type=request.user.user_type if hasattr(request.user, 'user_type') else None,
-                            timeout_seconds=120
+                            timeout_seconds=600
                         )
                         request.user.ai_report = cumulative_report
                         request.user.save(update_fields=['ai_report', 'updated_at'])

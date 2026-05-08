@@ -4,11 +4,29 @@ import os
 import json
 import asyncio
 import concurrent.futures
-from typing import List, Dict, Any, Tuple
+import threading
+import time
 import logging
 from pathlib import Path
+from typing import List, Dict, Any, Tuple
 from datetime import datetime
 from django.conf import settings
+
+# ----------------------------------------------------------------------
+# Persistent agent for cumulative analysis (starts once, reused)
+# ----------------------------------------------------------------------
+_CUMULATIVE_AGENT = None
+_CUMULATIVE_AGENT_LOCK = threading.Lock()
+
+def get_cumulative_agent():
+    """Reuse a single SilentAgent for all cumulative analyses."""
+    global _CUMULATIVE_AGENT
+    if _CUMULATIVE_AGENT is None:
+        with _CUMULATIVE_AGENT_LOCK:
+            if _CUMULATIVE_AGENT is None:
+                from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
+                _CUMULATIVE_AGENT = SilentAgent(start_servers=True)
+    return _CUMULATIVE_AGENT
 
 # ----------------------------------------------------------------------
 # 1. Make sure the MCP agent root is in sys.path
@@ -34,15 +52,12 @@ if "scoring" in agent_module.SERVER_PATHS:
 from mcp_agent.agent.agent import BiologicalAgent
 
 class DebugAgentWithCapture(BiologicalAgent):
-    """
-    Subclass that prints intermediate results to console AND collects them in a list.
-    """
+    """Subclass that prints intermediate results to console AND collects them in a list."""
     def __init__(self, debug_collector: List[str], start_servers=True):
         self.debug_collector = debug_collector
         super().__init__(start_servers=start_servers)
 
     def _log(self, message: str):
-        """Print to console and append to collector."""
         print(message)
         self.debug_collector.append(message)
 
@@ -118,25 +133,14 @@ class DebugAgentWithCapture(BiologicalAgent):
 logger = logging.getLogger(__name__)
 
 def extract_filtering_report(full_report: dict) -> dict:
-    """
-    Extract Phase A (filter) data from the full agent report.
-    Returns a dict with "chemicals" (list of chemical names) and "safe_skipped" (list of safe ingredients with reasons).
-    """
     if not full_report or "products" not in full_report or not full_report["products"]:
         return {"chemicals": [], "safe_skipped": []}
     product_data = full_report["products"][0]
-    chemicals = [
-        chem["name"] for chem in product_data.get("ingredients", {}).get("chemicals_evaluated", [])
-    ]
+    chemicals = [chem["name"] for chem in product_data.get("ingredients", {}).get("chemicals_evaluated", [])]
     safe_skipped = product_data.get("ingredients", {}).get("safe_skipped", [])
     return {"chemicals": chemicals, "safe_skipped": safe_skipped}
 
 def extract_investigation_report(full_report: dict) -> dict:
-    """
-    Extract the subset of the report that should go into Product.investigation_report.
-    Keeps: product_id, product_name, usage, exposure_type, drivers, ingredients (full object), and summary.
-    Removes combination_risks (not needed).
-    """
     if not full_report or "products" not in full_report or not full_report["products"]:
         return {}
     product_data = full_report["products"][0].copy()
@@ -144,7 +148,6 @@ def extract_investigation_report(full_report: dict) -> dict:
     return product_data
 
 def get_reports_folder() -> Path:
-    """Return path to reports folder, create if not exists."""
     reports_path = Path(settings.BASE_DIR) / "reports"
     reports_path.mkdir(exist_ok=True)
     return reports_path
@@ -159,10 +162,6 @@ def analyze_ingredients_risks(
     user_id: int = None,
     product_id: int = None
 ) -> Tuple[List[Dict[str, str]], Dict[str, Any], List[str], str]:
-    """
-    Runs the full MCP agent (with debug prints and capture) and returns:
-        risk_items, report, debug_log, saved_file_path
-    """
     if not ingredients_list:
         logger.info("No ingredients provided, returning empty risks")
         return [], {}, [], ""
@@ -184,7 +183,6 @@ def analyze_ingredients_risks(
         result = agent.run_sync([product], user_type=user_type)
         report = result.get("report", {})
 
-        # Extract risk items
         risk_items = []
         for product_out in report.get("products", []):
             for chem in product_out.get("ingredients", {}).get("chemicals_evaluated", []):
@@ -198,7 +196,6 @@ def analyze_ingredients_risks(
                     level = "low"
                 risk_items.append({"ingredient": name, "level": level})
 
-        # Save full report to disk inside reports/ folder with user/product naming
         try:
             reports_dir = get_reports_folder()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -210,7 +207,6 @@ def analyze_ingredients_risks(
                 filename = f"agent_report_{timestamp}_{safe_name}.json"
             filepath = reports_dir / filename
             saved_file_path = str(filepath)
-
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump({
                     "timestamp": timestamp,
@@ -219,7 +215,6 @@ def analyze_ingredients_risks(
                     "risk_items": risk_items,
                     "full_report": report
                 }, f, indent=2, ensure_ascii=False)
-
             logger.info(f"Agent report saved to {filepath}")
         except Exception as e:
             logger.warning(f"Could not save agent report to disk: {e}")
@@ -229,20 +224,24 @@ def analyze_ingredients_risks(
     finally:
         agent.close()
 
+
 def analyze_cumulative_risks(
     products_with_reports: List[Dict[str, Any]],
     user_type: str = None,
-    timeout_seconds: int = 120
+    timeout_seconds: int = 600
 ) -> Dict[str, Any]:
     """
     Run only Phases C, D, E using cached investigation reports.
-    No debug capture (silent).
+    Uses a persistent agent; if it fails, creates a fresh one.
     """
+    import time
+    start_time = time.time()
+    print(f"🚀 Starting cumulative analysis with {len(products_with_reports)} products (timeout={timeout_seconds}s)")
+
     if not products_with_reports or len(products_with_reports) < 2:
         return {"error": "Cumulative analysis requires at least 2 products"}
 
-    from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
-
+    # Build agent product list
     agent_products = []
     for p in products_with_reports:
         agent_products.append({
@@ -253,72 +252,138 @@ def analyze_cumulative_risks(
             "ingredient_list": p.get("ingredient_list", [])
         })
 
+    # Extract findings from investigation reports
     findings = []
+    skipped_products = 0
     for prod in products_with_reports:
         report = prod.get("investigation_report")
         if not report or not isinstance(report, dict):
+            print(f"⚠️ Product {prod.get('product_id')} has no investigation_report, skipping")
+            skipped_products += 1
             continue
+
         chemicals = report.get("ingredients", {}).get("chemicals_evaluated", [])
         prod_id = prod["product_id"]
+
+        if not chemicals:
+            print(f"⚠️ Product {prod_id} has zero chemicals_evaluated, skipping")
+            skipped_products += 1
+            continue
+
         for chem in chemicals:
-            # Safe handling of verdict which might be None
+            # SAFE extraction with None handling
+            name = chem.get("name")
+            uid = chem.get("uid")
+
             verdict = chem.get("verdict")
-            if verdict is None:
+            if verdict is None or not isinstance(verdict, dict):
                 verdict = {}
-            
+            danger_level = verdict.get("danger_level", "UNKNOWN")
+
             risk_calc = verdict.get("risk_calculation_breakdown", {}) if isinstance(verdict, dict) else {}
-            
+            if risk_calc is None:
+                risk_calc = {}
+            risk_score = risk_calc.get("total_score", 0)
+
+            body_effects = chem.get("body_effects")
+            if body_effects is None or not isinstance(body_effects, dict):
+                body_effects = {}
+            target_organs = body_effects.get("target_organs", []) or []
+
+            hazard = chem.get("hazard")
+            if hazard is None or not isinstance(hazard, dict):
+                hazard = {}
+            h_codes = hazard.get("h_codes", []) or []
+
+            resolution = chem.get("resolution")
+            if resolution is None or not isinstance(resolution, dict):
+                resolution = {}
+            method = resolution.get("method", "cached")
+            confidence = resolution.get("confidence", 0.5) or 0.5
+
+            identity = chem.get("identity") or {}
+            dose_eval = chem.get("dose_evaluation") or {}
+            personalisation = chem.get("personalisation")
+
             findings.append({
-                "name": chem.get("name"),
-                "uid": chem.get("uid"),
-                "target_organs": chem.get("body_effects", {}).get("target_organs", []) if isinstance(chem.get("body_effects"), dict) else [],
-                "h_codes": chem.get("hazard", {}).get("h_codes", []) if isinstance(chem.get("hazard"), dict) else [],
-                "preliminary_risk": verdict.get("danger_level", "UNKNOWN") if isinstance(verdict, dict) else "UNKNOWN",
-                "risk_score": risk_calc.get("total_score", 0),
-                "source": chem.get("resolution", {}).get("method", "cached") if isinstance(chem.get("resolution"), dict) else "cached",
-                "confidence": chem.get("resolution", {}).get("confidence", 0.5) if isinstance(chem.get("resolution"), dict) else 0.5,
-                "kg_confidence": chem.get("resolution", {}).get("confidence", 0.5) if isinstance(chem.get("resolution"), dict) else 0.5,
-                "resolution": chem.get("resolution", {}) if isinstance(chem.get("resolution"), dict) else {},
-                "identity": chem.get("identity", {}) if isinstance(chem.get("identity"), dict) else {},
-                "hazard": chem.get("hazard", {}) if isinstance(chem.get("hazard"), dict) else {},
-                "body_effects": chem.get("body_effects", {}) if isinstance(chem.get("body_effects"), dict) else {},
-                "dose_evaluation": chem.get("dose_evaluation", {}) if isinstance(chem.get("dose_evaluation"), dict) else {},
-                "verdict": verdict if isinstance(verdict, dict) else {},
-                "personalisation": chem.get("personalisation"),
+                "name": name,
+                "uid": uid,
+                "target_organs": target_organs,
+                "h_codes": h_codes,
+                "preliminary_risk": danger_level,
+                "risk_score": risk_score,
+                "source": method,
+                "confidence": confidence,
+                "kg_confidence": confidence,
+                "resolution": resolution,
+                "identity": identity,
+                "hazard": hazard,
+                "body_effects": body_effects,
+                "dose_evaluation": dose_eval,
+                "verdict": verdict,
+                "personalisation": personalisation,
                 "product_id": prod_id,
             })
 
-    if not findings:
-        return {"error": "No chemical findings could be extracted"}
+    print(f"📊 Extracted {len(findings)} chemical findings in {time.time()-start_time:.1f}s (skipped {skipped_products} products)")
 
+    if not findings:
+        return {"error": "No chemical findings could be extracted from the provided reports"}
+
+    # Try to use persistent agent; if it fails (loop closed or dead), create a fresh one
     agent = None
     try:
+        agent = get_cumulative_agent()
+        loop = agent._loop
+        if loop.is_closed():
+            raise RuntimeError("Persistent agent loop is closed")
+    except Exception as e:
+        print(f"⚠️ Persistent agent unavailable ({e}). Creating a fresh agent for this call.")
+        from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
         agent = SilentAgent(start_servers=True)
         loop = agent._loop
 
-        async def _run_cumulative():
-            combination = await agent._phase_combination(findings, agent_products)
-            report_dict = agent._build_final_report(
-                agent_products,
-                filter_result={"chemicals": [], "safe_skipped": []},
-                findings=findings,
-                combination=combination
-            )
-            report_dict = await agent._enhance_with_scoring_server(report_dict)
-            return report_dict
+    async def _run_cumulative():
+        print(f"🔗 Phase C: combination analysis...")
+        combination = await asyncio.wait_for(agent._phase_combination(findings, agent_products), timeout=timeout_seconds//2)
+        print(f"   Phase C done in {time.time()-start_time:.1f}s")
 
+        print(f"📝 Phase D: building final report...")
+        report_dict = agent._build_final_report(
+            agent_products,
+            filter_result={"chemicals": [], "safe_skipped": []},
+            findings=findings,
+            combination=combination
+        )
+        print(f"   Phase D done in {time.time()-start_time:.1f}s")
+
+        print(f"📈 Phase E: scoring server...")
+        report_dict = await asyncio.wait_for(agent._enhance_with_scoring_server(report_dict), timeout=timeout_seconds//2)
+        print(f"   Phase E done in {time.time()-start_time:.1f}s")
+        return report_dict
+
+    try:
         future = asyncio.run_coroutine_threadsafe(_run_cumulative(), loop)
         cumulative_report = future.result(timeout=timeout_seconds)
+        print(f"✅ Cumulative analysis completed in {time.time()-start_time:.1f}s")
+        # If we used a fresh agent, replace the global persistent one (close old)
+        if agent is not get_cumulative_agent():
+            global _CUMULATIVE_AGENT
+            old = _CUMULATIVE_AGENT
+            _CUMULATIVE_AGENT = agent
+            if old:
+                try:
+                    old.close()
+                except:
+                    pass
         return cumulative_report
-
     except concurrent.futures.TimeoutError:
+        print(f"❌ Timeout after {timeout_seconds}s")
         return {"error": f"Cumulative analysis timed out after {timeout_seconds} seconds"}
     except Exception as e:
         logger.exception("Cumulative analysis failed")
+        print(f"❌ Exception: {type(e).__name__}: {e}")
         return {"error": str(e)}
-    finally:
-        if agent:
-            agent.close()
 
 
 if __name__ == "__main__":
