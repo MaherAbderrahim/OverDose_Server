@@ -53,12 +53,20 @@
 <div class="container">
     <h1>🧪 Complete System Test Dashboard</h1>
 
-    <!-- AUTH CARD -->
+    <!-- AUTH CARD with User Type selector -->
     <div class="card">
         <h2>🔐 Login / Register</h2>
         <div class="flex-row">
             <div style="flex:1"><label>Email</label><input type="email" id="login-email" placeholder="user@example.com" value="alice@example.com"></div>
             <div style="flex:1"><label>Password</label><input type="password" id="login-password" placeholder="password" value="alice123"></div>
+            <div style="flex:1">
+                <label>User Type (for registration)</label>
+                <select id="user-type">
+                    <option value="general">General</option>
+                    <option value="diabetes">Diabetes</option>
+                    <option value="fetal">Fetal / Pregnancy</option>
+                </select>
+            </div>
             <div><button id="btn-login">Login</button></div>
             <div><button id="btn-register" class="secondary">Register</button></div>
             <div><button id="btn-logout" class="danger">Logout</button></div>
@@ -411,11 +419,13 @@ document.getElementById('btn-login').onclick = async function() {
         await updateUI();
     } else alert('Login failed: ' + JSON.stringify(res.data));
 };
+
 document.getElementById('btn-register').onclick = async function() {
     var email = document.getElementById('login-email').value;
     var pwd = document.getElementById('login-password').value;
+    var userType = document.getElementById('user-type').value;  // read selected user type
     var name = email.split('@')[0];
-    var payload = { first_name: name, last_name: 'Test', email: email, password: pwd, user_type: 'diabetes' };
+    var payload = { first_name: name, last_name: 'Test', email: email, password: pwd, user_type: userType };
     var res = await apiCall('/api/users/auth/register/', 'POST', payload, false);
     if (res.ok) {
         token = res.data.token;
@@ -424,6 +434,7 @@ document.getElementById('btn-register').onclick = async function() {
         await updateUI();
     } else alert('Registration failed: ' + JSON.stringify(res.data));
 };
+
 document.getElementById('btn-logout').onclick = function() {
     token = null;
     currentUser = null;

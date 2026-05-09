@@ -9,7 +9,7 @@ import time
 import logging
 import requests
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from django.conf import settings
 
@@ -32,91 +32,30 @@ if "scoring" in agent_module.SERVER_PATHS:
         print("⚠️ Scoring server disabled (chromadb missing)\n")
 
 # ----------------------------------------------------------------------
-# 3. Import the real BiologicalAgent and create a capturing DebugAgent
+# 3. Import the real BiologicalAgent (no debug subclass)
 # ----------------------------------------------------------------------
 from mcp_agent.agent.agent import BiologicalAgent
 
-class DebugAgentWithCapture(BiologicalAgent):
-    """Subclass that prints intermediate results to console AND collects them in a list."""
-    def __init__(self, debug_collector: List[str], start_servers=True):
-        self.debug_collector = debug_collector
-        super().__init__(start_servers=start_servers)
-
-    def _log(self, message: str):
-        print(message)
-        self.debug_collector.append(message)
-
-    async def _phase_filter(self, products_list):
-        self._log("\n" + "="*70)
-        self._log("🔍 PHASE A: FILTER (classifying ingredients with Groq)")
-        self._log("="*70)
-        result = await super()._phase_filter(products_list)
-        self._log(f"\n✅ Filter complete:")
-        self._log(f"   Chemicals to investigate: {[c['name'] for c in result.get('chemicals', [])]}")
-        self._log(f"   Safe (skipped): {[s['name'] for s in result.get('safe_skipped', [])]}")
-        if result.get('unclassified'):
-            self._log(f"   Unclassified: {result['unclassified']}")
-        return result
-
-    async def _investigate_chemical(self, name, product_usage="cosmetics"):
-        self._log(f"\n  🔬 Investigating: {name} (usage: {product_usage})")
-        finding = await super()._investigate_chemical(name, product_usage)
-        risk = finding.get('preliminary_risk', 'UNKNOWN')
-        source = finding.get('source', '?')
-        if finding.get('resolution', {}).get('unresolved'):
-            self._log(f"     ❌ {name} → {risk} (not in KG)")
-        else:
-            organs = finding.get('target_organs', [])
-            self._log(f"     ✅ {name} → {risk} (source: {source}, organs: {organs if organs else 'none'})")
-        return finding
-
-    async def _phase_combination(self, findings, products_list):
-        self._log("\n" + "="*70)
-        self._log("🔗 PHASE C: COMBINATION ANALYSIS (organ overlap, cumulative, hazard intersection)")
-        self._log("="*70)
-        result = await super()._phase_combination(findings, products_list)
-        organ = result.get('organ_overlap', {})
-        self._log(f"\n📊 Organ overlap: has_overlap={organ.get('has_overlap', False)}")
-        if organ.get('has_overlap'):
-            self._log(f"   Overlapping organs: {list(organ.get('global_organ_analysis', {}).keys())}")
-            self._log(f"   Verdict escalation: {organ.get('verdict_escalation')}")
-        cumul = result.get('cumulative_flags', [])
-        if cumul:
-            self._log(f"⚠️ Cumulative flags: {len(cumul)} chemical(s) appear in multiple products")
-        else:
-            self._log("✅ No cumulative concerns")
-        return result
-
-    def _build_final_report(self, products_list, filter_result, findings, combination):
-        self._log("\n" + "="*70)
-        self._log("📝 PHASE D: BUILDING FINAL REPORT")
-        self._log("="*70)
-        report = super()._build_final_report(products_list, filter_result, findings, combination)
-        for p in report.get('products', []):
-            summary = p.get('summary', {})
-            self._log(f"\n📦 Product: {p.get('product_name')}")
-            self._log(f"   Critical: {summary.get('critical',0)} | High: {summary.get('high',0)} | Moderate: {summary.get('moderate',0)} | Low: {summary.get('low',0)} | Unknown: {summary.get('unknown',0)}")
-            if p.get('drivers'):
-                self._log(f"   Risk drivers: {p['drivers']}")
-        return report
-
-    async def _enhance_with_scoring_server(self, report_dict):
-        self._log("\n" + "="*70)
-        self._log("📈 PHASE E: SCORING SERVER (optional)")
-        self._log("="*70)
-        result = await super()._enhance_with_scoring_server(report_dict)
-        if 'scoring_analysis' in result:
-            self._log("✅ Scoring analysis added.")
-        else:
-            self._log("⚠️ Scoring server not available or failed.")
-        return result
-
-
-# ----------------------------------------------------------------------
-# 4. Helper functions for extracting parts of the report
-# ----------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
+
+# ----------------------------------------------------------------------
+# 4. Global agent singleton (servers started once)
+# ----------------------------------------------------------------------
+_global_agent: Optional[BiologicalAgent] = None
+
+def get_global_agent() -> BiologicalAgent:
+    """Return a singleton BiologicalAgent instance (servers started once)."""
+    global _global_agent
+    if _global_agent is None:
+        _global_agent = BiologicalAgent(start_servers=True)
+        print("✅ Global MCP agent started (servers running).")
+    return _global_agent
+
+
+# ----------------------------------------------------------------------
+# 5. Helper functions for extracting parts of the report
+# ----------------------------------------------------------------------
 def extract_filtering_report(full_report: dict) -> dict:
     if not full_report or "products" not in full_report or not full_report["products"]:
         return {"chemicals": [], "safe_skipped": []}
@@ -125,12 +64,14 @@ def extract_filtering_report(full_report: dict) -> dict:
     safe_skipped = product_data.get("ingredients", {}).get("safe_skipped", [])
     return {"chemicals": chemicals, "safe_skipped": safe_skipped}
 
+
 def extract_investigation_report(full_report: dict) -> dict:
     if not full_report or "products" not in full_report or not full_report["products"]:
         return {}
     product_data = full_report["products"][0].copy()
     product_data.pop("combination_risks", None)
     return product_data
+
 
 def get_reports_folder() -> Path:
     reports_path = Path(settings.BASE_DIR) / "reports"
@@ -139,21 +80,26 @@ def get_reports_folder() -> Path:
 
 
 # ----------------------------------------------------------------------
-# 5. Main analysis functions
+# 6. Main analysis function (single product)
 # ----------------------------------------------------------------------
 def analyze_ingredients_risks(
     ingredients_list: List[str],
     user_type: str = None,
     user_id: int = None,
-    product_id: int = None
+    product_id: int = None,
+    agent: Optional[BiologicalAgent] = None,
 ) -> Tuple[List[Dict[str, str]], Dict[str, Any], List[str], str]:
     if not ingredients_list:
         logger.info("No ingredients provided, returning empty risks")
         return [], {}, [], ""
 
-    logger.info(f"Analyzing {len(ingredients_list)} ingredients with DebugAgentWithCapture")
-    debug_log = []
-    agent = DebugAgentWithCapture(debug_log, start_servers=True)
+    # Use provided agent, otherwise get the global singleton
+    if agent is None:
+        agent = get_global_agent()
+    else:
+        logger.info("Using provided agent instance.")
+
+    logger.info(f"Analyzing {len(ingredients_list)} ingredients with BiologicalAgent")
     saved_file_path = ""
 
     try:
@@ -204,29 +150,42 @@ def analyze_ingredients_risks(
         except Exception as e:
             logger.warning(f"Could not save agent report to disk: {e}")
 
-        return risk_items, report, debug_log, saved_file_path
+        # Return empty debug_log list (no extra debug logs collected)
+        return risk_items, report, [], saved_file_path
 
     finally:
-        agent.close()
+        # Do NOT close the agent if it's the global singleton
+        # Only close if we created a temporary agent (but we never do here)
+        pass
 
 
+# ----------------------------------------------------------------------
+# 7. Cumulative analysis function (multiple products)
+# ----------------------------------------------------------------------
 def analyze_cumulative_risks(
     products_with_reports: List[Dict[str, Any]],
     user_type: str = None,
-    timeout_seconds: int = 600
+    timeout_seconds: int = 600,
+    agent: Optional[BiologicalAgent] = None,
 ) -> Dict[str, Any]:
     """
-    Run only Phases C, D, E using cached investigation reports.
-    Creates a fresh agent for each call (to avoid loop deadlocks).
+    Run cumulative analysis by calling the agent directly with multiple products.
+    Prints detailed results to console and saves a JSON report.
     """
     import time
+    import json
+    from datetime import datetime
+    from django.conf import settings
+
     start_time = time.time()
     print(f"🚀 Starting cumulative analysis with {len(products_with_reports)} products (timeout={timeout_seconds}s)")
 
     if not products_with_reports or len(products_with_reports) < 2:
         return {"error": "Cumulative analysis requires at least 2 products"}
 
-    # Build agent product list
+    # ------------------------------------------------------------------
+    # 1. Build the product list in the format the agent expects
+    # ------------------------------------------------------------------
     agent_products = []
     for p in products_with_reports:
         agent_products.append({
@@ -237,137 +196,139 @@ def analyze_cumulative_risks(
             "ingredient_list": p.get("ingredient_list", [])
         })
 
-    # Extract findings from investigation reports
-    findings = []
-    skipped_products = 0
-    for prod in products_with_reports:
-        report = prod.get("investigation_report")
-        if not report or not isinstance(report, dict):
-            print(f"⚠️ Product {prod.get('product_id')} has no investigation_report, skipping")
-            skipped_products += 1
-            continue
+    print("📦 Agent products:")
+    print(json.dumps(agent_products, indent=2))
 
-        chemicals = report.get("ingredients", {}).get("chemicals_evaluated", [])
-        prod_id = prod["product_id"]
+    # ------------------------------------------------------------------
+    # 2. Get the agent (reuse global singleton or use provided)
+    # ------------------------------------------------------------------
+    if agent is None:
+        agent = get_global_agent()
+        print("♻️ Using global agent for cumulative analysis (servers already running).")
+    else:
+        print("♻️ Using provided agent.")
 
-        if not chemicals:
-            print(f"⚠️ Product {prod_id} has zero chemicals_evaluated, skipping")
-            skipped_products += 1
-            continue
-
-        for chem in chemicals:
-            # SAFE extraction with None handling
-            name = chem.get("name")
-            uid = chem.get("uid")
-
-            verdict = chem.get("verdict")
-            if verdict is None or not isinstance(verdict, dict):
-                verdict = {}
-            danger_level = verdict.get("danger_level", "UNKNOWN")
-
-            risk_calc = verdict.get("risk_calculation_breakdown", {}) if isinstance(verdict, dict) else {}
-            if risk_calc is None:
-                risk_calc = {}
-            risk_score = risk_calc.get("total_score", 0)
-
-            body_effects = chem.get("body_effects")
-            if body_effects is None or not isinstance(body_effects, dict):
-                body_effects = {}
-            target_organs = body_effects.get("target_organs", []) or []
-
-            hazard = chem.get("hazard")
-            if hazard is None or not isinstance(hazard, dict):
-                hazard = {}
-            h_codes = hazard.get("h_codes", []) or []
-
-            resolution = chem.get("resolution")
-            if resolution is None or not isinstance(resolution, dict):
-                resolution = {}
-            method = resolution.get("method", "cached")
-            confidence = resolution.get("confidence", 0.5) or 0.5
-
-            identity = chem.get("identity") or {}
-            dose_eval = chem.get("dose_evaluation") or {}
-            personalisation = chem.get("personalisation")
-
-            findings.append({
-                "name": name,
-                "uid": uid,
-                "target_organs": target_organs,
-                "h_codes": h_codes,
-                "preliminary_risk": danger_level,
-                "risk_score": risk_score,
-                "source": method,
-                "confidence": confidence,
-                "kg_confidence": confidence,
-                "resolution": resolution,
-                "identity": identity,
-                "hazard": hazard,
-                "body_effects": body_effects,
-                "dose_evaluation": dose_eval,
-                "verdict": verdict,
-                "personalisation": personalisation,
-                "product_id": prod_id,
-            })
-
-    print(f"📊 Extracted {len(findings)} chemical findings in {time.time()-start_time:.1f}s (skipped {skipped_products} products)")
-
-    if not findings:
-        return {"error": "No chemical findings could be extracted from the provided reports"}
-
-    # Create a fresh agent each time (to avoid event loop issues)
-    from mcp_agent.agent.agent import BiologicalAgent as SilentAgent
-    agent = None
+    # ------------------------------------------------------------------
+    # 3. Run the agent with the full product list
+    # ------------------------------------------------------------------
     try:
-        agent = SilentAgent(start_servers=True)
-        loop = agent._loop
+        result = agent.run_sync(agent_products, user_type=user_type)
+        report = result.get("report", {})
 
-        async def _run_cumulative():
-            print(f"🔗 Phase C: combination analysis...")
-            combination = await asyncio.wait_for(agent._phase_combination(findings, agent_products), timeout=timeout_seconds//2)
-            print(f"   Phase C done in {time.time()-start_time:.1f}s")
+        # --- Print cumulative results to console (same as single but with cross‑product info) ---
+        print("\n" + "="*70)
+        print("📊 CUMULATIVE ANALYSIS RESULTS")
+        print("="*70)
 
-            print(f"📝 Phase D: building final report...")
-            report_dict = agent._build_final_report(
-                agent_products,
-                filter_result={"chemicals": [], "safe_skipped": []},
-                findings=findings,
-                combination=combination
-            )
-            print(f"   Phase D done in {time.time()-start_time:.1f}s")
+        # Global summary
+        global_summary = report.get("global_summary", {})
+        print(f"\n🌍 Global Summary:")
+        print(f"   Products analysed: {len(agent_products)}")
+        print(f"   Products to avoid: {global_summary.get('products_to_avoid', 0)}")
+        print(f"   Products to reduce: {global_summary.get('products_to_reduce', 0)}")
+        print(f"   High risk chemicals: {global_summary.get('high_chemicals', [])}")
+        print(f"   Organs under pressure: {global_summary.get('organs_under_pressure', [])}")
 
-            print(f"📈 Phase E: scoring server...")
-            report_dict = await asyncio.wait_for(agent._enhance_with_scoring_server(report_dict), timeout=timeout_seconds//2)
-            print(f"   Phase E done in {time.time()-start_time:.1f}s")
-            return report_dict
+        # Organ overlap (global analysis)
+        organ_analysis = global_summary.get("organ_global_analysis", {})
+        if organ_analysis:
+            print("\n🧠 Organ Overlap (cross‑product):")
+            for organ, data in organ_analysis.items():
+                print(f"   {organ}: {data.get('total_unique_count', 0)} unique chemicals")
+        else:
+            print("\n🧠 No organ overlap detected.")
 
-        future = asyncio.run_coroutine_threadsafe(_run_cumulative(), loop)
-        cumulative_report = future.result(timeout=timeout_seconds)
-        print(f"✅ Cumulative analysis completed in {time.time()-start_time:.1f}s")
-        return cumulative_report
+        # Scoring analysis (product rankings, recurrence)
+        scoring = report.get("scoring_analysis", {})
+        ranked = scoring.get("ranked_products", [])
+        if ranked:
+            print("\n🏆 Product Rankings (by risk score):")
+            for r in ranked:
+                print(f"   #{r['rank']}: {r['product_name']} - {r['verdict']} (score: {r['total_product_score']})")
+        else:
+            print("\n🏆 No product rankings available.")
 
-    except concurrent.futures.TimeoutError:
-        print(f"❌ Timeout after {timeout_seconds}s")
-        return {"error": f"Cumulative analysis timed out after {timeout_seconds} seconds"}
+        recurrence = scoring.get("recurrence_risks", [])
+        if recurrence:
+            print("\n⚠️ Recurrence Risks (chemicals in multiple products):")
+            for r in recurrence:
+                print(f"   {r['chemical']} appears in {r['frequency']} products (score: {r['recurrence_score']})")
+        else:
+            print("\n✅ No recurrence risks.")
+
+        # Also print per‑product verdicts (like in single‑product analysis)
+        product_verdicts = report.get("product_verdicts", [])
+        if product_verdicts:
+            print("\n📦 Product Verdicts:")
+            for pv in product_verdicts:
+                print(f"   {pv['product_name']}: {pv['risk_level']} - {pv['recommendation']}")
+                if pv.get('risk_drivers'):
+                    print(f"      Drivers: {', '.join(pv['risk_drivers'])}")
+
+        print("\n" + "="*70)
+
+        # ------------------------------------------------------------------
+        # 4. Extract risk items for backward compatibility (optional)
+        # ------------------------------------------------------------------
+        risk_items = []
+        for product_out in report.get("products", []):
+            for chem in product_out.get("ingredients", {}).get("chemicals_evaluated", []):
+                name = chem.get("name")
+                danger = chem.get("verdict", {}).get("danger_level", "UNKNOWN")
+                if danger in ("CRITICAL", "HIGH"):
+                    level = "high"
+                elif danger == "MODERATE":
+                    level = "medium"
+                else:
+                    level = "low"
+                risk_items.append({
+                    "ingredient": name,
+                    "level": level,
+                    "product_id": product_out.get("product_id")
+                })
+
+        # ------------------------------------------------------------------
+        # 5. Save the cumulative report (JSON file)
+        # ------------------------------------------------------------------
+        try:
+            reports_dir = Path(settings.BASE_DIR) / "reports"
+            reports_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            first_name = agent_products[0].get("product_name", "cumulative")[:20]
+            filename = f"cumulative_report_{timestamp}_{first_name}.json"
+            filepath = reports_dir / filename
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump({
+                    "timestamp": timestamp,
+                    "user_type": user_type,
+                    "product_count": len(agent_products),
+                    "risk_items": risk_items,
+                    "full_report": report
+                }, f, indent=2, ensure_ascii=False)
+            print(f"💾 Cumulative report saved to {filepath}")
+        except Exception as e:
+            print(f"⚠️ Could not save cumulative report: {e}")
+
+        # Print timing summary
+        elapsed = time.time() - start_time
+        print(f"\n✅ Cumulative analysis completed in {elapsed:.1f}s")
+
+        return report
+
     except Exception as e:
-        logger.exception("Cumulative analysis failed")
-        print(f"❌ Exception: {type(e).__name__}: {e}")
+        import traceback
+        print(f"❌ Cumulative analysis failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
         return {"error": str(e)}
-    finally:
-        if agent:
-            try:
-                agent.close()
-            except:
-                pass
 
 
+# ----------------------------------------------------------------------
+# 8. API communication helpers
+# ----------------------------------------------------------------------
 def send_report_to_recommendation_api(
     report_dict: Dict[str, Any],
     base_url: str = "http://127.0.0.1:8000"
 ) -> Dict[str, Any]:
-    """
-    Send the cumulative report to the recommendation research endpoint.
-    """
     url = f"{base_url}/api/recommend/research/report"
     try:
         response = requests.post(url, json=report_dict, timeout=60)
@@ -386,15 +347,11 @@ def send_report_to_recommendation_api(
 
 
 def should_trigger_recommendation_api(report_dict: Dict[str, Any]) -> bool:
-    """
-    Determine whether the cumulative report contains a verdict that warrants
-    calling the recommendation research API.
-    """
     product_verdicts = report_dict.get("product_verdicts", [])
     for pv in product_verdicts:
         rec = pv.get("recommendation", "").lower()
         risk_level = pv.get("risk_level", "").upper()
-        if rec in ["reduce", "reduce_use", "keep", "eliminate"]:
+        if rec in ["reduce", "reduce_use", "eliminate"]:
             return True
         if risk_level in ["HIGH", "CRITICAL", "MODERATE"]:
             return True
@@ -408,6 +365,9 @@ def should_trigger_recommendation_api(report_dict: Dict[str, Any]) -> bool:
     return False
 
 
+# ----------------------------------------------------------------------
+# 9. Test (if run directly)
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     test_ingredients = ["Lysine", "Formaldehyde", "AQUA"]
     risk_items, report, debug_log, filepath = analyze_ingredients_risks(test_ingredients, user_type="fetal")

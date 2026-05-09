@@ -28,9 +28,9 @@ INSTALLED_APPS = [
     "users",
     "products",
     "scan",
-    "risk",
     "recommendation",
     "dashboard",
+    "risk.apps.RiskConfig",
 ]
 
 MIDDLEWARE = [

@@ -41,7 +41,6 @@ from .models import Scan
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
-
 class ScanPipelineAPIView(APIView):
     def post(self, request):
         if "image" not in request.FILES:
@@ -115,6 +114,7 @@ class ScanPipelineAPIView(APIView):
         user_decision = "pending"
         agent_debug_log = None
         saved_report_path = None
+        cumulative_report = None          # <-- FIX 1: define at the top
 
         if ingredients:
             ingredients_str = ",".join(sorted([i.strip().lower() for i in ingredients if i]))
@@ -151,7 +151,7 @@ class ScanPipelineAPIView(APIView):
                     product.investigation_report = investigation_data
                     product.save(update_fields=["filtering_report", "investigation_report", "updated_at"])
                 else:
-                    risk_items = []
+                    risk_items = []          # will be filled later by the extraction block
                     full_agent_report = product.investigation_report
                     logger.info(f"Using cached investigation_report for product {product.id}")
             else:
@@ -204,7 +204,6 @@ class ScanPipelineAPIView(APIView):
                 user_decision = user_decision_obj.decision
 
             # --- CUMULATIVE ANALYSIS ---
-            cumulative_report = None
             if request.user.is_authenticated:
                 try:
                     approved_saved = UserProductDecision.objects.filter(
@@ -243,24 +242,28 @@ class ScanPipelineAPIView(APIView):
                             timeout_seconds=300
                         )
 
-                        if "error" not in cumulative_report:
-                            request.user.ai_report = cumulative_report
-                            request.user.save(update_fields=['ai_report', 'updated_at'])
+                        # FIX 3: explicit error checking
+                        if cumulative_report and isinstance(cumulative_report, dict):
+                            if "error" not in cumulative_report:
+                                request.user.ai_report = cumulative_report
+                                request.user.save(update_fields=['ai_report', 'updated_at'])
 
-                            # Conditionally send to recommendation API
-                            if should_trigger_recommendation_api(cumulative_report):
-                                try:
-                                    base_url = request.build_absolute_uri('/').rstrip('/')
-                                    recommendations = send_report_to_recommendation_api(cumulative_report, base_url)
-                                    cumulative_report["recommendations_from_api"] = recommendations
-                                except Exception as e:
-                                    logger.warning(f"Could not send report to recommendation API: {e}")
-                                    cumulative_report["recommendations_from_api"] = {"error": str(e)}
+                                if should_trigger_recommendation_api(cumulative_report):
+                                    try:
+                                        base_url = request.build_absolute_uri('/').rstrip('/')
+                                        recommendations = send_report_to_recommendation_api(cumulative_report, base_url)
+                                        cumulative_report["recommendations_from_api"] = recommendations
+                                    except Exception as e:
+                                        logger.warning(f"Could not send report to recommendation API: {e}")
+                                        cumulative_report["recommendations_from_api"] = {"error": str(e)}
+                                else:
+                                    logger.info("No actionable recommendation; skipping API call.")
+                                    cumulative_report["recommendations_from_api"] = {"info": "No high-risk products found; search API not triggered."}
                             else:
-                                logger.info("No actionable recommendation; skipping API call.")
-                                cumulative_report["recommendations_from_api"] = {"info": "No high-risk products found; search API not triggered."}
+                                logger.warning(f"Cumulative analysis returned error: {cumulative_report.get('error')}")
                         else:
-                            logger.warning(f"Cumulative analysis returned error: {cumulative_report.get('error')}")
+                            logger.warning("Cumulative analysis returned None or non-dict")
+                            cumulative_report = {"error": "Cumulative analysis did not return a valid report"}
                     else:
                         cumulative_report = {"info": "Only one product in user's list, cumulative analysis skipped."}
 
@@ -299,7 +302,7 @@ class ScanPipelineAPIView(APIView):
             "risks": risk_items,
             "recommendations": recommendation_result["recommendations"],
             "user_decision": user_decision,
-            "cumulative_report": cumulative_report if 'cumulative_report' in locals() else None,
+            "cumulative_report": cumulative_report,   # <-- FIX 4: no locals() check
             "agent_debug_log": agent_debug_log,
             "saved_report_path": saved_report_path,
         }
