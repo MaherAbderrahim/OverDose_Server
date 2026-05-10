@@ -6,6 +6,15 @@ from .managers import UserManager
 
 class User(AbstractBaseUser, PermissionsMixin):
     # User type choices
+    # Flutter frontend user types (primary)
+    USER_TYPE_ADULT = "adult"
+    USER_TYPE_PREGNANT = "pregnant"
+    USER_TYPE_CHILD = "child"
+    USER_TYPE_SENSITIVE_SKIN = "sensitive_skin"
+    USER_TYPE_ATHLETE = "athlete"
+    USER_TYPE_OTHER = "other"
+
+    # Legacy medical types (kept for DB backward-compatibility)
     USER_TYPE_ASTHMA = "asthma"
     USER_TYPE_DIABETES = "diabetes"
     USER_TYPE_NEWBORN = "newborn"
@@ -14,6 +23,13 @@ class User(AbstractBaseUser, PermissionsMixin):
     USER_TYPE_PCOS = "pcos"
 
     USER_TYPE_CHOICES = [
+        (USER_TYPE_ADULT, "Adulte"),
+        (USER_TYPE_PREGNANT, "Grossesse"),
+        (USER_TYPE_CHILD, "Enfant"),
+        (USER_TYPE_SENSITIVE_SKIN, "Peau sensible"),
+        (USER_TYPE_ATHLETE, "Sportif"),
+        (USER_TYPE_OTHER, "Autre"),
+        # Legacy
         (USER_TYPE_ASTHMA, "Asthma"),
         (USER_TYPE_DIABETES, "Diabetes"),
         (USER_TYPE_NEWBORN, "Newborn"),

@@ -149,6 +149,7 @@ class CurrentUserTypeAPIView(APIView):
 class AllergyListCreateAPIView(generics.ListCreateAPIView):
     queryset = Allergy.objects.all()
     serializer_class = AllergySerializer
+    permission_classes = [IsAuthenticated]
 
 
 class UserAllergyListCreateAPIView(generics.ListCreateAPIView):
