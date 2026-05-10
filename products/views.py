@@ -24,6 +24,27 @@ class ProductListCreateAPIView(generics.ListCreateAPIView):
             return queryset.filter(owner=user) | queryset.filter(owner__isnull=True)
         return queryset
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        ingredients = serializer.validated_data.get('ingredients', [])
+        if ingredients:
+            import hashlib
+            ingredients_str = ",".join(sorted([i.strip().lower() for i in ingredients if i]))
+            ingredients_hash = hashlib.md5(ingredients_str.encode()).hexdigest()
+            existing_product = Product.objects.filter(ingredients_hash=ingredients_hash).first()
+            if existing_product:
+                owner = self.request.user if self.request.user.is_authenticated else None
+                if owner and not existing_product.owner:
+                    existing_product.owner = owner
+                    existing_product.save(update_fields=['owner'])
+                return Response(self.get_serializer(existing_product).data, status=status.HTTP_200_OK)
+                
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def perform_create(self, serializer):
         owner = self.request.user if self.request.user.is_authenticated else None
         serializer.save(owner=owner)
@@ -124,7 +145,7 @@ class UserProductsView(generics.ListAPIView):
         elif status_filter == 'rejected':
             decisions = ['rejected']
         else:  # 'active' - default
-            decisions = ['approved', 'saved']
+            decisions = ['approved', 'saved', 'pending']
         
         product_ids = UserProductDecision.objects.filter(
             user=user,
