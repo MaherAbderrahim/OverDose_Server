@@ -39,6 +39,159 @@ from mcp_agent.agent.agent import BiologicalAgent
 logger = logging.getLogger(__name__)
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _first_product_data(full_report: dict) -> Dict[str, Any]:
+    if not full_report or "products" not in full_report or not full_report["products"]:
+        return {}
+    first = full_report["products"][0]
+    return dict(first) if isinstance(first, dict) else {}
+
+
+def _summary_counts(product_data: Dict[str, Any]) -> Dict[str, Any]:
+    summary = _as_dict(product_data.get("summary"))
+    ingredients = _as_dict(product_data.get("ingredients"))
+    chemicals = _as_list(ingredients.get("chemicals_evaluated"))
+    safe_skipped = _as_list(ingredients.get("safe_skipped"))
+    return {
+        "total_ingredients": summary.get("total_ingredients", len(chemicals) + len(safe_skipped)),
+        "chemicals_evaluated": summary.get("chemicals_evaluated", len(chemicals)),
+        "critical_count": summary.get("critical", 0),
+        "high_count": summary.get("high", 0),
+        "moderate_count": summary.get("moderate", 0),
+        "low_count": summary.get("low", 0),
+        "safe_count": summary.get("safe", len(safe_skipped)),
+        "organ_overlap_flags": summary.get("organ_overlap_flags", 0),
+    }
+
+
+def _report_status(product_data: Dict[str, Any]) -> str:
+    if not product_data:
+        return "minimal"
+    summary = _as_dict(product_data.get("summary"))
+    ingredients = _as_dict(product_data.get("ingredients"))
+    chemicals = _as_list(ingredients.get("chemicals_evaluated"))
+    if summary and chemicals:
+        return "complete"
+    if summary or chemicals:
+        return "partial"
+    return "minimal"
+
+
+def _summary_text(product_data: Dict[str, Any]) -> str:
+    name = product_data.get("product_name") or product_data.get("name") or "this product"
+    status = _report_status(product_data)
+    if status == "complete":
+        return f"A complete verified analysis is available for {name}."
+    if status == "partial":
+        return f"A partial analysis is available for {name}. Verified safety signals are shown first."
+    return f"We do not yet have enough verified data to complete the analysis for {name}."
+
+
+def _key_findings(product_data: Dict[str, Any]) -> List[str]:
+    findings: List[str] = []
+    summary = _as_dict(product_data.get("summary"))
+    ingredients = _as_dict(product_data.get("ingredients"))
+    chemicals = _as_list(ingredients.get("chemicals_evaluated"))
+    for field in ("drivers", "warnings", "key_findings", "recommendations"):
+        for item in _as_list(product_data.get(field)):
+            text = str(item).strip()
+            if text and text not in findings:
+                findings.append(text)
+    for chem in chemicals:
+        if not isinstance(chem, dict):
+            continue
+        verdict = _as_dict(chem.get("verdict"))
+        danger = str(verdict.get("danger_level") or "").upper()
+        if danger in {"CRITICAL", "HIGH"}:
+            name = str(chem.get("name") or "").strip()
+            if name and name not in findings:
+                findings.append(name)
+    combination = _as_dict(product_data.get("combination_risks"))
+    organ_overlap = _as_dict(combination.get("organ_overlap"))
+    for organ in _as_list(organ_overlap.get("overlapping_organs")):
+        text = str(organ).strip()
+        if text and text not in findings:
+            findings.append(text)
+    if not findings:
+        total = summary.get("total_ingredients") or len(chemicals)
+        findings.append(f"{total} ingredient signal(s) were checked.")
+    return findings[:5]
+
+
+def _organ_impact(product_data: Dict[str, Any]) -> List[str]:
+    summary = _as_dict(product_data.get("summary"))
+    organs = _as_list(summary.get("organs_under_pressure"))
+    if organs:
+        return [str(item) for item in organs if str(item).strip()]
+    combination = _as_dict(product_data.get("combination_risks"))
+    organ_overlap = _as_dict(combination.get("organ_overlap"))
+    return [str(item) for item in _as_list(organ_overlap.get("overlapping_organs")) if str(item).strip()]
+
+
+def _risk_breakdown(product_data: Dict[str, Any]) -> Dict[str, Any]:
+    counts = _summary_counts(product_data)
+    return {
+        "critical": counts["critical_count"],
+        "high": counts["high_count"],
+        "moderate": counts["moderate_count"],
+        "low": counts["low_count"],
+        "safe": counts["safe_count"],
+    }
+
+
+def _normalize_investigation_report(full_report: dict) -> dict:
+    product_data = _first_product_data(full_report)
+    if not product_data:
+        return {
+            "report_status": "minimal",
+            "summary": {"text": "We do not yet have enough verified data to complete this analysis."},
+            "key_findings": [],
+            "organ_impact": [],
+            "risk_breakdown": {},
+        }
+
+    normalized = product_data.copy()
+    summary = _as_dict(normalized.get("summary"))
+    summary.setdefault("text", _summary_text(normalized))
+    summary.update(_summary_counts(normalized))
+    normalized["summary"] = summary
+    normalized["report_status"] = _report_status(normalized)
+    normalized["key_findings"] = _key_findings(normalized)
+    normalized["organ_impact"] = _organ_impact(normalized)
+    normalized["risk_breakdown"] = _risk_breakdown(normalized)
+    return normalized
+
+
+def _normalize_filtering_report(full_report: dict) -> dict:
+    product_data = _first_product_data(full_report)
+    if not product_data:
+        return {
+            "report_status": "minimal",
+            "chemicals": [],
+            "safe_skipped": [],
+            "summary": "No verified ingredient filtering data is available yet.",
+        }
+
+    ingredients = _as_dict(product_data.get("ingredients"))
+    chemicals = [chem.get("name") for chem in _as_list(ingredients.get("chemicals_evaluated")) if isinstance(chem, dict) and chem.get("name")]
+    safe_skipped = _as_list(ingredients.get("safe_skipped"))
+    status = _report_status(product_data)
+    summary = _summary_text(product_data)
+    return {
+        "report_status": status,
+        "chemicals": chemicals,
+        "safe_skipped": safe_skipped,
+        "summary": summary,
+    }
+
+
 # ----------------------------------------------------------------------
 # 4. Global agent singleton (servers started once)
 # ----------------------------------------------------------------------
@@ -57,20 +210,33 @@ def get_global_agent() -> BiologicalAgent:
 # 5. Helper functions for extracting parts of the report
 # ----------------------------------------------------------------------
 def extract_filtering_report(full_report: dict) -> dict:
-    if not full_report or "products" not in full_report or not full_report["products"]:
-        return {"chemicals": [], "safe_skipped": []}
-    product_data = full_report["products"][0]
-    chemicals = [chem["name"] for chem in product_data.get("ingredients", {}).get("chemicals_evaluated", [])]
-    safe_skipped = product_data.get("ingredients", {}).get("safe_skipped", [])
-    return {"chemicals": chemicals, "safe_skipped": safe_skipped}
+    return _normalize_filtering_report(full_report)
 
 
 def extract_investigation_report(full_report: dict) -> dict:
-    if not full_report or "products" not in full_report or not full_report["products"]:
-        return {}
-    product_data = full_report["products"][0].copy()
-    product_data.pop("combination_risks", None)
-    return product_data
+    return _normalize_investigation_report(full_report)
+
+
+def normalize_cumulative_report(report_data: dict) -> dict:
+    if not report_data:
+        return {
+            "report_status": "minimal",
+            "overall_assessment": "We do not yet have enough verified cumulative data to summarize the current profile.",
+            "key_warnings": [],
+            "global_summary": {},
+            "scoring_analysis": {},
+        }
+
+    normalized = dict(report_data)
+    normalized["report_status"] = "complete" if normalized.get("overall_assessment") else "partial"
+    normalized.setdefault(
+        "overall_assessment",
+        "A partial cumulative assessment is available. Verified findings will deepen as more products are analyzed.",
+    )
+    normalized.setdefault("key_warnings", [])
+    normalized.setdefault("global_summary", normalized.get("global_summary") or {})
+    normalized.setdefault("scoring_analysis", normalized.get("scoring_analysis") or {})
+    return normalized
 
 
 def get_reports_folder() -> Path:

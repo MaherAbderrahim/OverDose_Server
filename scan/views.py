@@ -22,6 +22,7 @@ from risk.services import (
     analyze_cumulative_risks,
     extract_filtering_report,
     extract_investigation_report,
+    normalize_cumulative_report,
     send_report_to_recommendation_api, 
     should_trigger_recommendation_api,
 )
@@ -245,7 +246,7 @@ class ScanPipelineAPIView(APIView):
                         # FIX 3: explicit error checking
                         if cumulative_report and isinstance(cumulative_report, dict):
                             if "error" not in cumulative_report:
-                                request.user.ai_report = cumulative_report
+                                request.user.ai_report = normalize_cumulative_report(cumulative_report)
                                 request.user.save(update_fields=['ai_report', 'updated_at'])
 
                                 if should_trigger_recommendation_api(cumulative_report):

@@ -180,5 +180,9 @@ class CumulativeSummaryView(APIView):
             "overall_assessment": report.get("overall_assessment"),
             "safe_ingredients": report.get("safe_ingredients"),
             "unverified_chemicals": report.get("unverified_chemicals"),
+            "recommendations_from_api": report.get("recommendations_from_api"),
+            "products": report.get("products"),
+            "report_id": report.get("report_id"),
+            "analyzed_at": report.get("analyzed_at"),
         }
         return Response(extracted)
